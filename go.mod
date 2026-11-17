@@ -1,6 +1,6 @@
 module github.com/JDLu2003/vps-cluster
 
-go 1.26.5
+go 1.26.0
 
 require (
 	github.com/hashicorp/go-hclog v1.6.2
