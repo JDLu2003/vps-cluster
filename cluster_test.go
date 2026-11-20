@@ -319,3 +319,39 @@ func TestFreshClusterOnExistingData(t *testing.T) {
 		t.Fatal("新写入未生效")
 	}
 }
+
+func TestPrimaryAutoPromote(t *testing.T) {
+	old, oldReach := AutoPromoteAfter, ReachCheck
+	AutoPromoteAfter, ReachCheck = 2*time.Second, func() bool { return true }
+	defer func() { AutoPromoteAfter, ReachCheck = old, oldReach }()
+
+	a := newNode(t, "a", "", nil)
+	b := joinNode(t, "b", a)
+	defer b.Close()
+	mustApply(t, a, "k 1")
+	allHave(t, []*tnode{a, b}, "k", "1")
+	a.Close()
+	// 不需要人工操作：备设备在主设备失联后自动成为写节点
+	waitFor(t, "备设备自动提升", 30*time.Second, func() bool { return b.IsWriter() })
+	mustApply(t, b, "k 2")
+	re := startNode(t, "a", a.dir, a.addr, "", nil)
+	defer re.Close()
+	waitFor(t, "旧主降级", 20*time.Second, func() bool { return re.Info().Role == "replica" })
+	allHave(t, []*tnode{re, b}, "k", "2")
+}
+
+func TestNoAutoPromoteWhenIsolated(t *testing.T) {
+	old, oldReach := AutoPromoteAfter, ReachCheck
+	AutoPromoteAfter, ReachCheck = time.Second, func() bool { return false } // 本机自己断网
+	defer func() { AutoPromoteAfter, ReachCheck = old, oldReach }()
+
+	a := newNode(t, "a", "", nil)
+	b := joinNode(t, "b", a)
+	defer b.Close()
+	waitFor(t, "b 成为备设备", 20*time.Second, func() bool { return b.Info().Role == "replica" })
+	a.Close()
+	time.Sleep(6 * time.Second)
+	if b.IsWriter() {
+		t.Fatal("本机连不上外网时不应自动提升")
+	}
+}

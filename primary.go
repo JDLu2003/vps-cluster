@@ -3,7 +3,9 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -165,20 +167,50 @@ func (n *Node) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// AutoPromoteAfter：主备模式下，备设备连续这么久连不上主设备就自动提升为主设备（<=0 关闭）。
+// 旧主设备恢复后会看到更高的 epoch 自动降级，并以新主设备的快照为准（期间它自己的写入丢弃）。
+var AutoPromoteAfter = 30 * time.Second
+
+// ReachCheck 判断本机网络是否正常（能连上外网）。自动提升前先检查：
+// 备设备自己断网时不应提升，否则恢复后会让一直正常的主设备丢掉这段时间的写入。
+var ReachCheck = func() bool {
+	for _, addr := range []string{"1.1.1.1:443", "8.8.8.8:443", "223.5.5.5:443"} {
+		if c, err := net.DialTimeout("tcp", addr, 3*time.Second); err == nil {
+			c.Close()
+			return true
+		}
+	}
+	return false
+}
+
+// unreachable 表示主设备连不上（而不是主设备回复了别的状态）。
+type unreachable struct{ error }
+
 // followLoop 是备设备的复制循环。
 func (n *Node) followLoop(ctx context.Context, addr string, epoch uint64) {
 	client := httpClientFor(n.identity, pollWait+15*time.Second)
 	backoff := time.Second
+	lastOK := time.Now()
 	for ctx.Err() == nil {
 		err := n.pollOnce(ctx, client, addr, epoch)
 		if err == nil {
 			backoff = time.Second
+			lastOK = time.Now()
 			continue
 		}
 		if ctx.Err() != nil {
 			return
 		}
 		n.cfg.logf("从主设备 %s 复制失败: %v", addr, err)
+		var u unreachable
+		if errors.As(err, &u) && AutoPromoteAfter > 0 && time.Since(lastOK) >= AutoPromoteAfter {
+			if ReachCheck() {
+				n.cfg.logf("主设备 %s 已 %s 联系不上，自动提升本机为主设备", addr, time.Since(lastOK).Round(time.Second))
+				go n.autoPromote(epoch)
+				return
+			}
+			n.cfg.logf("主设备联系不上，但本机也连不上外网，暂不提升")
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -195,7 +227,7 @@ func (n *Node) pollOnce(ctx context.Context, client *http.Client, addr string, e
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr+"/_cluster/log?"+q.Encode(), nil)
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return unreachable{err}
 	}
 	defer resp.Body.Close()
 	switch resp.StatusCode {
@@ -225,6 +257,20 @@ func (n *Node) pollOnce(ctx context.Context, client *http.Client, addr string, e
 		return fmt.Errorf("主设备状态不一致 (对方 epoch %d, 角色 %s)", in.Epoch, in.Role)
 	}
 	return fmt.Errorf("HTTP %d", resp.StatusCode)
+}
+
+// autoPromote 在确认本机仍是 epoch 下的备设备后提升为主设备（不能在 followLoop 里直接调用：
+// 提升会停掉 followLoop 所在的模式）。
+func (n *Node) autoPromote(epoch uint64) {
+	n.mu.Lock()
+	still := n.p.Epoch == epoch && modeOf(n.p.Members) == ModePrimary && n.p.Primary != n.self && !n.p.Removed && !n.joining
+	n.mu.Unlock()
+	if !still {
+		return
+	}
+	if err := n.ForcePromote(); err != nil {
+		n.cfg.logf("自动提升失败: %v", err)
+	}
 }
 
 // restoreFrom 从指定节点拉取快照并恢复。
